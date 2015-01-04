@@ -8,6 +8,8 @@ credentials and extract the configuration and some running information from
 the device. It will attempt to use the protocols SSH, HTTPS, telnet and HTTP
 until it gets a successful connection
 
+Usage
+=====
     Usage: cisco_snarf {options} hosts
     Options:
 	-u|--username username 
@@ -18,8 +20,8 @@ until it gets a successful connection
 	-P|--prefix - File or directory prefix to use in constructing the output file names
 	-d : Turn on debugging
 
-
-Requires:
-python version 2.6
-pexpect
-ssh client
+Requires
+========
+- python version 2.6
+- pexpect
+- ssh client
