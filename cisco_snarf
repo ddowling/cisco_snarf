@@ -1,0 +1,397 @@
+#!/usr/bin/env python
+"""cisco_snarf
+Copyright: Open Source Solutions Pty Ltd
+Author: Denis Dowling (dpd@opsol.com.au)
+
+This utility will connect with a list of Cisco devices using the supplied
+credentials and extract the configuration and some running information from
+the device. It will attempt to use the protocols SSH, HTTPS, telnet and HTTP
+until it gets a successful connection
+
+Usage: cisco_snarf {options} hosts
+Options:
+    -u|--username username 
+    -p|--password password
+    -e|--enable enable_password
+    -f|--file hosts_file - Read hostnames from a file
+    -m|--mechanism - Connection mechanism. Can be specified more than one. Either ssh, https, telnet or http
+    -P|--prefix - File or directory prefix to use in constructing the output file names
+    -d : Turn on debugging
+"""
+import getpass
+import re
+import getopt
+import sys
+
+import pexpect
+import urllib2
+
+debug = False
+username = None
+password = None
+enable_password = None
+supported_mechanisms = [ "ssh", "https", "telnet", "http" ]
+mechanisms = []
+prefix = None
+unix_eol = False
+
+
+class Usage(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+class ConnectionError(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+class CommandError(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+class ExpectConnection:
+    def __init__(self):
+        self.child = None
+	self.prompt = ">"
+
+    def ssh_connect(self, host):
+	ssh_newkey = 'Are you sure you want to continue connecting'
+	self.child = pexpect.spawn('ssh -l %s %s'%(username, host))
+	i = self.child.expect([pexpect.TIMEOUT, ssh_newkey, '[P|p]assword: ', 'Connection refused'])
+	if i == 0: # Timeout
+	    raise ConnectionError("SSH could not login. SSH Output:" + self.child.before)
+	if i == 3: # Refused
+	    raise ConnectionError("SSH connection refused")
+
+	if i == 1: # SSH does not have the public key. Just accept it.
+	    self.child.sendline ('yes')
+	    i = self.child.expect([pexpect.TIMEOUT, '[P|p]assword: '])
+	    if i == 0: # Timeout
+		raise ConnectionError("SSH could not login. SSH Output:" + self.child.before)
+	self.child.sendline(password)
+	i = self.child.expect([pexpect.TIMEOUT, '>'])
+	if i == 0:
+	    raise ConnectionError("Timeout waiting for prompt. Got: " + self.child.before)
+	self.set_prompt()
+
+    def set_prompt(self):
+	# Last line of the output will be the prompt
+	s = self.child.before + self.child.after
+	self.prompt = s.split("\n")[-1]
+	if debug:
+	    print "Prompt is '%s'" % (self.prompt)
+
+    def telnet_connect(self, host):
+	self.child = pexpect.spawn('telnet %s' % (host))
+	i = self.child.expect([pexpect.TIMEOUT, '[U|u]sername: '])
+	if i == 0: # Timeout
+	    raise ConnectionError("telnet could not login. Telnet Output:" + self.child.before)
+	self.child.sendline(username)
+	i = self.child.expect([pexpect.TIMEOUT, '[P|p]assword: '])
+	if i == 0: # Timeout
+	    raise ConnectionError("telnet could not login. Telnet Output:" + self.child.before)
+
+	self.child.sendline(password)
+	i = self.child.expect([pexpect.TIMEOUT, '>', '[U|u]sername: '])
+	if i != 1: # Timeout
+	    raise ConnectionError("telnet could not login. Telnet Output:" + self.child.before)
+	self.set_prompt()
+
+
+    def do_command(self, command):
+	if debug:
+	    print "Sending:", command
+	self.child.sendline(command)
+
+	res = ""
+	while True:
+	    i = self.child.expect([pexpect.TIMEOUT, self.prompt, '--More--', '<--- More --->'])
+	    if i == 0:
+		raise CommandError("Timeout waiting for prompt for %s. Got: %s" % (command, self.child.before))
+
+	    res += self.child.before
+	    if i == 2 or i == 3:
+		# Space to get more output
+		self.child.send(" ")
+	    else:
+		break
+
+	#print "child.before='%s'" % (self.child.before)
+	#print "child.after='%s'" % (self.child.after)
+
+	# Strip off the initial command
+	start = res.find("\n")
+	if start > 0:
+	    res = res[start:]
+
+	# Strip leading and trailing blank lines
+	res = res.lstrip("\r\n")
+	res = res.rstrip("\r\n")
+
+	if debug:
+	    print "Received:", res
+	return res
+
+    def do_enable(self, enable_password):
+	self.child.sendline('enable')
+	i = self.child.expect([pexpect.TIMEOUT, 'Password: '])
+	if i == 0:
+	    raise CommandError("Timeout waiting for prompt for enable")
+
+	self.child.sendline(enable_password)
+	i = self.child.expect([pexpect.TIMEOUT, '#', 'Invalid password'])
+	if i == 0:
+	    raise CommandError('Enable command failed')
+	elif i != 1:
+	    raise CommandError('Failed enable login')
+	self.set_prompt()
+
+    def is_terminal(self):
+        return True
+
+class HTTPConnection:
+    def __init__(self):
+        self.url = ""
+
+    def connect(self, url):
+	self.url = url
+
+	try:
+	    passman = urllib2.HTTPPasswordMgrWithDefaultRealm()
+	    passman.add_password(None, url, username, password)
+
+	    auth_handler = urllib2.HTTPBasicAuthHandler(passman)
+
+	    opener = urllib2.build_opener(auth_handler)
+
+	    urllib2.install_opener(opener)
+
+	    f = urllib2.urlopen(self.url)
+	    res = f.read()
+	    if debug:
+		print "HTTP connect response : ", res
+	except urllib2.URLError, e:
+	    raise ConnectionError("Connection failed : " + str(e))
+
+
+    def http_connect(self, host):
+	url = "http://" + host + "/level/15/exec/";
+        self.connect(url)
+
+    def https_connect(self, host):
+	url = "https://" + host + "/level/15/exec/";
+        self.connect(url)
+
+    def do_command(self, command):
+        try:
+	    if debug:
+		print "Sending:", command
+	    command = command.replace(' ', '/')
+	
+	    f = urllib2.urlopen(self.url + command + "/CR")
+	    res = f.read()
+
+	    # find indexes of the content between the <FORM ...> and </FORM> tags
+	    start = res.find("<FORM")
+	    if start >= 0:
+		start = res.find(">", start)
+	    end = res.find("</FORM>")
+	    if debug:
+		print "Extracting content between %d and %d" % (start, end)
+
+	    if start >= 0 and end >= 0:
+		res = res[start+1:end]
+
+	    # Strip leading and trailing blank lines
+	    res = res.lstrip("\r\n")
+	    res = res.rstrip("\r\n")
+
+	    if debug:
+		print "Received:", res
+	    return res
+	except urllib2.URLError, e:
+	    raise CommandError("Command error : " + str(e))
+
+    def is_terminal(self):
+        return False
+
+
+def check_host(host):
+    con = None
+    for m in mechanisms:
+	try:
+	    if m == "ssh":
+	        con = ExpectConnection()
+		con.ssh_connect(host)
+	    elif m == "telnet":
+	        con = ExpectConnection()
+		con.telnet_connect(host)
+	    elif m == "http":
+	        con = HTTPConnection()
+		con.http_connect(host)
+	    elif m == "https":
+	        con = HTTPConnection()
+		con.https_connect(host)
+	    break
+	except ConnectionError, e:
+	    if debug:
+	        print("Connection mechanism %s failed with error '%s'" % (m, e.msg))
+	    con = None
+
+    if con is None:
+        raise ConnectionError("Cannot connect to " + host)
+
+    res = con.do_command("show version")
+
+    is_ios = False
+    is_asa = False
+    is_pix = False
+    if re.search("Cisco IOS Software", res) or re.search("Cisco Internetwork Operating System Software", res):
+	if debug:
+	    print "Found Cisco IOS"
+	is_ios = True
+    elif re.search("Cisco Adaptive Security Appliance Software", res):
+	if debug:
+	    print "Found Cisco ASA"
+	is_asa = True
+    elif re.search("Cisco PIX Security Appliance Software", res):
+	if debug:
+	    print "Found Cisco PIX"
+	is_pix = True
+    else:
+	raise CommandError("Cannot determine Cisco device type for hostname " + host)
+
+    # Set to unlimited output lines and move to enabled mode
+    if con.is_terminal():
+	if is_ios:
+	    con.do_command("terminal length 0")
+
+	global enable_password
+	if not enable_password:
+	    enable_password = getpass.getpass('Enable Password: ')
+
+	con.do_enable(enable_password)
+
+	# For the ASA the terminal command is only available in enable mode
+	if is_asa or is_pix:
+	    con.do_command("terminal pager lines 0")
+
+	# Don't want output from syslong when saving command results
+	con.do_command("terminal no monitor")
+
+    commands = ( "show version",
+                 "show running",
+		 "show config",
+		 "show interface",
+		 "show ntp status",
+		 "show ntp associations")
+
+    for cmd in commands:
+	res = con.do_command(cmd)
+
+	if unix_eol:
+	    # replace \r\n with just \n to be consistent with what
+	    # telnet output does
+	    res = res.replace("\r\n", "\n")
+
+	filename = cmd.replace(" ", "_") + ".txt"
+	if prefix:
+	    filename = prefix + filename
+	else:
+	    filename = host + "_" + filename
+
+	f = open(filename, "w")
+	f.write(res)
+	f.close()
+
+def main(argv = None):
+    if argv is None:
+       argv = sys.argv
+
+    global username, password, enable_password, debug, mechanisms, prefix
+
+    try:
+        try:
+	    opts, args = getopt.getopt(argv[1:],
+	    	"u:p:e:f:m:P:dh",
+		["username=", "password=", "enable=", "file=", "mechanism=", "prefix=", "debug", "help"])
+	except getopt.error, msg:
+	    raise Usage(msg)
+
+	host_file = None
+
+	# process options
+	for o, a in opts:
+	    if o in ("-h", "--help"):
+	        print __doc__
+		return 0
+	    elif o in ("-u", "--username"):
+	    	username = a
+	    elif o in ("-p", "--password"):
+	    	password = a
+	    elif o in ("-e", "--enable"):
+	    	enable_password = a
+	    elif o in ("-f", "--file"):
+	    	host_file = a
+	    elif o in ("-m", "--mechanism"):
+	        if a not in supported_mechanisms:
+		    raise Usage(a + " is not a supported connection mechanism")
+	    	mechanisms.append(a)
+	    elif o in ("-P", "--prefix"):
+	    	prefix = a
+	    elif o in ("-d", "--debug"):
+	        debug = True
+
+	hosts = []
+	if host_file:
+	    f = open(host_file, "r")
+	    for line in f:
+	        line = line.rstrip()
+		if len(line) == 0:
+		    continue
+		if line[0] == '#':
+		    continue
+		hosts.append(line)
+	else:
+	    hosts = args
+
+	if len(hosts) == 0:
+	    raise Usage("Must specify at least one hostname")
+
+	# If no connection mechanism is specified then try them all
+        if len(mechanisms) == 0:
+	    mechanisms = supported_mechanisms
+
+	for host in hosts:
+	    # parse out any username and password in the host 
+	    if host.find("@") > 0:
+	        (username, host) = host.split("@")
+
+	    if username is None:
+		username = raw_input('Username: ')
+
+	    if username.find(":") > 0:
+	        (username, password) = username.split(":")
+
+	    if password is None:
+		password = getpass.getpass('Password: ')
+
+	    try:
+	        check_host(host)
+	        print "Downloaded configuration from %s" % (host)
+	    except CommandError, err:
+	        print "Failed to get configuration from %s" % (host)
+	        print err.msg
+	    except ConnectionError, err:
+	        print "Failed to connect to %s" % (host)
+	        print err.msg
+
+
+    except Usage, err:
+        print >>sys.stderr, err.msg
+        print >>sys.stderr, "For more help use --help"
+	return 2
+
+if __name__ == "__main__":
+    res = main()
+    sys.exit(res)
+
